@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 from src.utils import sigmoid, row_normalize
@@ -19,7 +19,26 @@ class ModelParameters:
     @property
     def trace_decay(self):
         return np.exp(-self.beta)
-    
+
+@dataclass
+class ConsolidationParameters:
+    # currently implemented type
+    conso_type: str = 'veridical'
+
+    # global synaptic retention before replay
+    global_retention: float = 0.9
+
+    # number of replay episodes sample from the original exposure sequence
+    n_replay: int = 100
+
+    # length of each replay episode
+    replay_length: int = 20
+
+    beta_consolidation: float = 0.30
+    lr_consolidation: float = 0.01
+    normalize_lag1_strength: bool = True
+
+
 class HebbianSequenceModel:
     def __init__(self, n_nodes, params):
         self.n_nodes = n_nodes
@@ -32,11 +51,17 @@ class HebbianSequenceModel:
 
         self.exposure_seq = None
 
-    def update_tone(self, trace, tone_curr, lr):
+    def update_tone(self, trace, tone_curr, lr=None, trace_decay=None):
         tone_curr = int(tone_curr)
 
+        if lr is None:
+            lr = self.params.lr
+
+        if trace_decay is None:
+            trace_decay = self.params.trace_decay
+
         # decay of trace
-        trace *= self.params.trace_decay
+        trace *= trace_decay
 
         # update according to trace strength
         self.W[:,tone_curr] += (lr * trace)
@@ -173,7 +198,7 @@ class HebbianSequenceModel:
     def copy(self):
         copied_model = HebbianSequenceModel(
             n_nodes=self.n_nodes,
-            params=self.params,
+            params=replace(self.params),
         )
 
         copied_model.W = self.W.copy()
@@ -185,22 +210,82 @@ class HebbianSequenceModel:
 
         return copied_model
     
-    def consolidation(self, conso_type):
-        # conso_type is a string describing possible consolidation mechanism
-        # learning rate should be different from online learning
-        # beta sould be larger than online learning
+    def _replay_sequenece(self, sequence, lr, trace_decay):
+        sequence = np.asarray(sequence, dtype=int)
+        trace = np.zeros(self.n_nodes, dtype=float)
+        trace[sequence[0]] = 1.0
 
-        # global decay + replay with larger beta?
+        for tone_curr in sequence[1:]:
+            trace = self.update_tone(
+                trace=trace,
+                tone_curr=tone_curr,
+                lr=lr,
+                trace_decay=trace_decay,
+            )
+        return self
+    
+    def consolidate_veridical(self, rng, conso_params=None):
+        '''
+        Veridical replay consolidation
+        Mechanism:
+            [1] apply global decay to W
+            [2] sample contiguous fragments from the stored exposre sequence
+            [3] replay those fragments with a consolidation-specific beta and learning rate
+        
+        This replay is veridical as all replayed sequences are sampled from the actual exposure sequence, rather than generated from W.
+        '''
+        if conso_params is None:
+            conso_params = ConsolidationParameters(conso_type='veridical')
+
+        if self.exposure_seq is None:
+            raise ValueError("No exposure sequence stored in the model. \n Run learn_exposure() first.")
+        
+        exposure_length = len(self.exposure_seq)
+        if conso_params.replay_length > exposure_length:
+            raise ValueError(f"Replay length ({conso_params.replay_length}) cannot exceed exposure sequence length ({exposure_length}).")
+        
+
+        self.W *= conso_params.global_retention
+
+        trace_decay_conso = np.exp(-1*conso_params.beta_consolidation)
+
+        if conso_params.normalize_lag1_strength:
+            lr_effective = (conso_params.lr_consolidation / trace_decay_conso)
+        else:
+            lr_effective = conso_params.lr_consolidation
+        
+        max_start = exposure_length - conso_params.replay_length + 1
+        
+        for _ in range(conso_params.n_replay):
+            start = rng.integers(0, max_start)
+            replay_fragment = self.exposure_seq[start:start+conso_params.replay_length]
+            self._replay_sequenece(replay_fragment,
+                                   lr=lr_effective,
+                                   trace_decay=trace_decay_conso)
+        return self
+
+    def consolidation(self, conso_type, rng=None, conso_params=None):
+        '''
+        Dispatcher for consolidation mechanisms.
+        '''
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if conso_params is None:
+            conso_params = ConsolidationParameters(conso_type=conso_type)
+
+
         if conso_type == 'veridical':
-            pass
+            return self.consolidate_veridical(rng=rng, conso_params=conso_params)
         elif conso_type == 'associate_generative':
-            pass
+            raise NotImplementedError("This method is not implemented yet.")
         elif conso_type == 'selective':
-            pass
+            raise NotImplementedError("This method is not implemented yet.")
         elif conso_type == 'weight-space':
             # sharpening / diffusion / competitive normalization
-            pass
-        pass
+            raise NotImplementedError("This method is not implemented yet.")
+        else:
+            raise ValueError(f"Unknown consolidation type: {conso_type}")
 
 def evaluate_model(model, 
                    trials, 
