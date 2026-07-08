@@ -42,6 +42,11 @@ class ConsolidationParameters:
 
     replay_temperature: float = 1.0
 
+    # for prioritized replay
+    priority_count_alpha: float = 0.5
+    priority_surprisal_gamma: float = 1.0
+    priority_eps: float = 1e-12
+
 
 class HebbianSequenceModel:
     def __init__(self, n_nodes, params):
@@ -52,6 +57,9 @@ class HebbianSequenceModel:
             (n_nodes, n_nodes),
             dtype=float
         )
+
+        self.C = np.zeros((n_nodes, n_nodes), dtype=float) # transition count
+        self.S = np.zeros((n_nodes, n_nodes), dtype=float) # surprisal sum
 
         self.exposure_seq = None
 
@@ -78,6 +86,34 @@ class HebbianSequenceModel:
 
         return trace
     
+    def _predict_trans_prob(self, cue, target, eps=1e-12):
+        cue = int(cue)
+        target = int(target)
+        row = self.W[cue,:].copy().astype(float)
+
+        row[cue] = 0.0 # exclude self transition
+        row[row<0.0] = 0.0 # numerical safety
+        row_sum = row.sum()
+
+        if row_sum < eps:
+            if target == cue:
+                return eps
+            return 1.0 / (self.n_nodes - 1)
+        
+        p = row[target] / row_sum # normalization
+        return float(np.clip(p, eps, 1.0)) # bounded within [0 1.0]
+
+    def _record_trans_suprisal(self, cue, target, eps=1e-12):
+        cue = int(cue)
+        target = int(target)
+        p_model = self._predict_trans_prob(cue, target, eps=eps)
+        surprisal = -np.log(p_model + eps)
+        
+        self.C[cue, target] += 1.0
+        self.S[cue, target] += surprisal
+        
+        return surprisal
+
     def learn_exposure(self, sequence):
         sequence = np.asarray(sequence, dtype=int)
 
@@ -88,13 +124,17 @@ class HebbianSequenceModel:
         self.exposure_seq = sequence.copy()
 
         trace = np.zeros(self.n_nodes, dtype=float)
+        trace[sequence[0]] = 1.0
 
-        trace[sequence[0]] = 1
+        prev = int(sequence[0])
+
         for current in sequence[1:]:
+            self._record_trans_suprisal(prev, current)
             trace = self.update_tone(
                 trace=trace, 
                 tone_curr=current,
                 lr=self.params.lr)
+            prev = current
         
         return self
     
@@ -261,10 +301,13 @@ class HebbianSequenceModel:
             copied_model.exposure_seq = (
                 self.exposure_seq.copy()
             )
+        
+        copied_model.C = self.C.copy()
+        copied_model.S = self.S.copy()
 
         return copied_model
     
-    def _replay_sequenece(self, sequence, lr, trace_decay):
+    def _replay_sequence(self, sequence, lr, trace_decay):
         sequence = np.asarray(sequence, dtype=int)
         trace = np.zeros(self.n_nodes, dtype=float)
         trace[sequence[0]] = 1.0
@@ -313,11 +356,12 @@ class HebbianSequenceModel:
         for _ in range(conso_params.n_replay):
             start = rng.integers(0, max_start)
             replay_fragment = self.exposure_seq[start:start+conso_params.replay_length]
-            self._replay_sequenece(replay_fragment,
+            self._replay_sequence(replay_fragment,
                                    lr=lr_effective,
                                    trace_decay=trace_decay_conso)
         return self
 
+    # Generative replay helper functions
     def _transition_matrix_from_W(self, temperature=1):
         W_gen = self.W.copy().astype(float)
         
@@ -383,9 +427,122 @@ class HebbianSequenceModel:
             replay_fragment = self._sample_generative_sequence(trans_mat,
                                                                rng=rng,
                                                                replay_length=conso_params.replay_length)
-            self._replay_sequenece(replay_fragment,
+            self._replay_sequence(replay_fragment,
                                    lr=lr_effective,
                                    trace_decay=trace_decay_conso)
+        return self
+
+    # selective (prioritized) replay helper functions
+    def _priority_mat_from_surprisal(self, 
+                                     count_alpha=0.5,
+                                     surprisal_gamma=1.0,
+                                     eps=1e-12):
+        counts = self.C.copy()
+        np.fill_diagonal(counts, 0.0)
+
+        observed = counts > 0
+        mean_surprisal = np.zeros_like(counts, dtype=float)
+        mean_surprisal[observed] = self.S[observed] / np.maximum(self.C[observed], 1.0)
+
+        priority = np.zeros_like(counts, dtype=float)
+        priority[observed] = (
+            np.power(counts[observed], 
+                     count_alpha) 
+            * np.power(mean_surprisal[observed] + eps,
+                       surprisal_gamma)
+        )
+        np.fill_diagonal(priority, 0.0)
+
+        return priority
+
+    def _direct_trans_mat_from_C(self, eps=1e-12):
+        counts = self.C.copy()
+        np.fill_diagonal(counts, 0.0)
+        
+        P = np.zeros_like(counts, dtype=float)
+        for i in range(self.n_nodes):
+            row_sum = counts[i,:].sum()
+            if row_sum > eps:
+                P[i] = counts[i] / row_sum
+            else:
+                P[i] = 1.0 / (self.n_nodes - 1)
+                P[i, i] = 0.0
+        
+        return P
+
+    def _sample_edge_from_matrix(self, matrix, rng):
+        flat = matrix.ravel().astype(float)
+        total = flat.sum()
+        probs = flat / total
+
+        edge_idx = int(rng.choice(flat.size, p=probs))
+        return divmod(edge_idx, self.n_nodes)
+
+    def _sample_next_from_transmat(self, trans_mat, current, rng):
+        current = int(current)
+        probs = trans_mat[current].copy()
+        probs_sum = probs.sum()
+
+        probs = probs / probs_sum # normalization
+        return int(rng.choice(self.n_nodes, p=probs))
+
+    def _sample_prioritzed_sequence(self, priority_mat, trans_mat, rng, replay_length):
+        # seed based prioritized replay
+        seed_i, seed_j = self._sample_edge_from_matrix(priority_mat, rng)
+        
+        sequence = np.empty(replay_length, dtype=int)
+        sequence[0] = seed_i
+        sequence[1] = seed_j
+        current = seed_j
+
+        for t in range(2, replay_length):
+            current = self._sample_next_from_transmat(trans_mat,
+                                                      current,
+                                                      rng)
+            sequence[t] = current
+            
+        return sequence
+
+    def consolidate_selective(self, rng, conso_params=None):
+        '''
+        Prioritzied replay consolidation
+
+        Mechanism:
+            [1] build priority matrix from exposure-time transition surprisal
+            [2] build continuation transition matrix from experienced transition counts
+            [3] apply global decay
+            [4] generate replay sequences seeded by high-priority transitions
+            [5] replay-learn the generated sequences with consolidation-specific beta & lr
+        '''
+
+        if conso_params is None:
+            conso_params = ConsolidationParameters(conso_type='selective')
+        
+        priority_mat = self._priority_mat_from_surprisal(count_alpha=conso_params.priority_count_alpha,
+                                                         surprisal_gamma=conso_params.priority_surprisal_gamma,
+                                                         eps=conso_params.priority_eps)
+        trans_mat = self._direct_trans_mat_from_C(eps=conso_params.priority_eps)
+
+        # global decay
+        self.W *= conso_params.global_retention
+
+        # consolidation-specific trace decay
+        trace_decay_conso = np.exp(-1 * conso_params.beta_consolidation)
+        if conso_params.normalize_lag1_strength:
+            lr_effective = conso_params.lr_consolidation / trace_decay_conso
+        else:
+            lr_effective = conso_params.lr_consolidation
+        
+        # generate & learn replay sequences
+        for _ in range(conso_params.n_replay):
+            fragment = self._sample_prioritzed_sequence(priority_mat,
+                                                        trans_mat,
+                                                        rng,
+                                                        conso_params.replay_length)
+            self._replay_sequence(fragment,
+                                  lr=lr_effective,
+                                  trace_decay=trace_decay_conso)
+        
         return self
 
     def consolidation(self, conso_type, rng=None, conso_params=None):
@@ -404,7 +561,7 @@ class HebbianSequenceModel:
         elif conso_type == 'generative':
             return self.consolidate_generative(rng=rng, conso_params=conso_params)
         elif conso_type == 'selective':
-            raise NotImplementedError("This method is not implemented yet.")
+            return self.consolidate_selective(rng=rng, conso_params=conso_params)
         elif conso_type == 'weight-space':
             # sharpening / diffusion / competitive normalization
             raise NotImplementedError("This method is not implemented yet.")
