@@ -12,6 +12,8 @@ class ModelParameters:
     decision_gain: float = 20.0
     criterion_offset: float = 0.0
 
+    readout_mode: str = 'normalized'  # alternatives: 'contrast'
+
     lr: float = 1.0 # exposure learing rate
     lr_test_prefix:float = 1.0 # learning prefix of test sequences
     lr_test_probe:float = 0.1  # learning probe of test sequences
@@ -37,6 +39,8 @@ class ConsolidationParameters:
     beta_consolidation: float = 0.30
     lr_consolidation: float = 0.01
     normalize_lag1_strength: bool = True
+
+    replay_temperature: float = 1.0
 
 
 class HebbianSequenceModel:
@@ -94,6 +98,57 @@ class HebbianSequenceModel:
         
         return self
     
+    def transition_readout(self, cue, target):
+        '''
+        Compute both [1] representation level and [2] behavioural level readouts.
+        familiarity_normalized:
+            row-normalized association strength
+            this is a representation-level readout
+        familiarity_contrast:
+            raw association minus row-average association
+            this is a behavioural-level readout
+            reflecting confidence (amount of availavble memory), which is influenced by global decay
+        '''
+        cue = int(cue)
+        target = int(target)
+
+        row_raw = self.W[cue,:].copy()
+        row_raw[cue] = 0.0
+        row_sum = row_raw.sum()
+        uniform_baseline = 1.0 / (self.n_nodes - 1)
+
+        # normalize familiarity
+        if row_sum > 0:
+            familiarity_normalized = row_raw[target] / row_sum
+        else:
+            familiarity_normalized = uniform_baseline
+        
+        # raw contrast familiarity
+        row_mean = row_sum / (self.n_nodes - 1)
+        familiarity_contrast = row_raw[target] - row_mean
+
+        # choose behaviour evidence
+        if self.params.readout_mode == 'normalized':
+            familiarity = familiarity_normalized
+            decision_evidence = familiarity - uniform_baseline - self.params.criterion_offset
+
+        elif self.params.readout_mode == 'contrast':
+            familiarity = familiarity_contrast
+            decision_evidence = familiarity - self.params.criterion_offset
+        else:
+            raise ValueError(f"Unknown readout mode: {self.params.readout_mode}")
+        
+        p_yes = sigmoid(self.params.decision_gain * decision_evidence)
+     
+        return {
+            "familiarity": familiarity,
+            "familiarity_normalized": familiarity_normalized,
+            "familiarity_contrast": familiarity_contrast,
+            "decision_evidence": decision_evidence,
+            "p_yes": p_yes,
+            "row_strength": row_sum,
+        }
+
     def run_test_phase(self, trials):
         # initialize output
         results = (
@@ -112,8 +167,11 @@ class HebbianSequenceModel:
 
         # initialize readout (familiarity)
         familiarity = np.empty(n_trial, dtype=float)
+        familiarity_normalized = np.empty(n_trial, dtype=float)
+        familiarity_contrast = np.empty(n_trial, dtype=float)
         decision_evidence = np.empty(n_trial, dtype=float)
         p_yes = np.empty(n_trial, dtype=float)
+        row_strength = np.empty(n_trial, dtype=float)
 
         lr_prefix = self.params.lr_test_prefix
         lr_probe  = self.params.lr_test_probe
@@ -132,27 +190,30 @@ class HebbianSequenceModel:
                                          lr = lr_prefix)
         
             # readout before learning the final tone
-            ass_matrix = self.association_matrix(normalize=True)
-            familiarity[iTrial] = ass_matrix[cue, target]
-            uniform_baseline = 1 / (self.n_nodes - 1)
-            decision_evidence[iTrial] = (
-                familiarity[iTrial] 
-                - uniform_baseline 
-                - self.params.criterion_offset
-             )
-            p_yes[iTrial] = sigmoid(self.params.decision_gain * decision_evidence[iTrial])
+            readout = self.transition_readout(cue, target)
+            familiarity[iTrial] = readout['familiarity']
+            familiarity_normalized[iTrial] = readout['familiarity_normalized']
+            familiarity_contrast[iTrial] = readout['familiarity_contrast']
+            decision_evidence[iTrial] = readout['decision_evidence']
+            p_yes[iTrial] = readout['p_yes']
+            row_strength[iTrial] = readout['row_strength']
 
             # learn the final tone
             trace = self.update_tone(trace=trace,
                                      tone_curr=target,
                                      lr = lr_probe)
-            # add model readouts to the trial table
-            results['familiarity'] = familiarity
-            results['decision_evidence'] = decision_evidence
-            results['p_yes'] = p_yes
             
-            legal = results['legal'].to_numpy(dtype=bool) 
-            results['expected_acc'] = np.where(legal, p_yes, 1-p_yes)
+        # add model readouts to the trial table
+        results['familiarity'] = familiarity
+        results['familiarity_normalized'] = familiarity_normalized
+        results['familiarity_contrast'] = familiarity_contrast
+        results['decision_evidence'] = decision_evidence
+        results['p_yes'] = p_yes
+        results['row_strength'] = row_strength
+        
+        legal = results['legal'].to_numpy(dtype=bool) 
+        results['expected_acc'] = np.where(legal, p_yes, 1-p_yes)
+
         return results
     
     def association_matrix(self, normalize=True):
@@ -174,19 +235,12 @@ class HebbianSequenceModel:
         return float(matrix[cue, target])
     
     def decision_evidence(self, cue, target):
-        familiarity = self.get_familiarity(cue, 
-                                           target, 
-                                           normalize=True)
-        uniform_baseline = 1.0 / (self.n_nodes - 1)
-        evidence = familiarity - uniform_baseline - self.params.criterion_offset
-
-        return evidence
+        readout = self.transition_readout(cue, target)
+        return float(readout['decision_evidence'])
     
     def choice_probability(self, cue, target):
-        evidence = self.decision_evidence(cue, target)
-        p_yes = sigmoid(evidence * self.params.decision_gain)
-
-        return float(p_yes)
+        readout = self.transition_readout(cue, target)
+        return float(readout['p_yes'])
     
     def simulate_choice(self, cue, target, rng):
         p_yes = self.choice_probability(cue, target)
@@ -264,6 +318,76 @@ class HebbianSequenceModel:
                                    trace_decay=trace_decay_conso)
         return self
 
+    def _transition_matrix_from_W(self, temperature=1):
+        W_gen = self.W.copy().astype(float)
+        
+        # remove self transitions
+        np.fill_diagonal(W_gen, 0.0)
+
+        # keep only non-negative weights (though all weights should be positive)
+        W_gen[W_gen<0] = 0.0
+
+        # temperature transform
+        if temperature - 1.0 > 1e-5:
+            W_gen = np.power(W_gen, 1 / temperature)
+        
+        P = np.zeros_like(W_gen, dtype=float)
+        for i in range(self.n_nodes):
+            row_sum = W_gen[i].sum()
+            if row_sum > 0:
+                P[i] = W_gen[i] / row_sum
+            else:
+                P[i] = 1.0 / (self.n_nodes - 1)
+                P[i,i] = 0.0
+        return P
+    
+    def _sample_generative_sequence(self, trans_mat, rng, replay_length):
+        current = int(rng.integers(self.n_nodes))
+        sequence = np.empty(replay_length, dtype=int)
+
+        sequence[0] = current
+        for t in range(1, replay_length):
+            probs = trans_mat[current].copy()
+            probs = probs / probs.sum() # 其实已经是sum=1了，为了safty再做一次
+            current = int(rng.choice(self.n_nodes, p=probs))
+
+            sequence[t] = current
+        
+        return sequence
+
+    def consolidate_generative(self, rng, conso_params=None):
+        '''
+        Generative replay consolidation
+        Mechanism:
+            [1] build a replay transition matrix from the learned W
+            [2] global decay
+            [3] generate replay sequences from the transition matrix
+            [4] replay those generated sequences using the same Hebbian learning rule
+        '''
+
+        # build fixed generator from current learned W
+        trans_mat = self._transition_matrix_from_W(temperature=conso_params.replay_temperature)
+
+        # global decay
+        self.W *= conso_params.global_retention
+
+        # consolidation-specific trace decay
+        trace_decay_conso = np.exp(-1 * conso_params.beta_consolidation)
+        if conso_params.normalize_lag1_strength:
+            lr_effective = conso_params.lr_consolidation / trace_decay_conso
+        else:
+            lr_effective = conso_params.lr_consolidation
+
+        # generate & learn the sequences
+        for _ in range(conso_params.n_replay):
+            replay_fragment = self._sample_generative_sequence(trans_mat,
+                                                               rng=rng,
+                                                               replay_length=conso_params.replay_length)
+            self._replay_sequenece(replay_fragment,
+                                   lr=lr_effective,
+                                   trace_decay=trace_decay_conso)
+        return self
+
     def consolidation(self, conso_type, rng=None, conso_params=None):
         '''
         Dispatcher for consolidation mechanisms.
@@ -277,8 +401,8 @@ class HebbianSequenceModel:
 
         if conso_type == 'veridical':
             return self.consolidate_veridical(rng=rng, conso_params=conso_params)
-        elif conso_type == 'associate_generative':
-            raise NotImplementedError("This method is not implemented yet.")
+        elif conso_type == 'generative':
+            return self.consolidate_generative(rng=rng, conso_params=conso_params)
         elif conso_type == 'selective':
             raise NotImplementedError("This method is not implemented yet.")
         elif conso_type == 'weight-space':

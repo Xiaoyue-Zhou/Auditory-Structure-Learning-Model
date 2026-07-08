@@ -2,8 +2,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from seaborn import colors
 
-def plot_day1_byType(data, title, my_color):
+def plot_day1_byType(data, measure, title, my_color):
     trial_order = ['within_legal',
                'between_legal',
                'within_illegal',
@@ -11,14 +12,14 @@ def plot_day1_byType(data, title, my_color):
     
     avg_within_subj = (
         data.groupby(['subj', 'trial_type'], as_index=False)
-        .agg(familiarity = ('familiarity', 'mean'))
+        .agg(value = (measure, 'mean'))
     )
 
     dat4plot = (
         avg_within_subj.groupby('trial_type', as_index=False)
-        .agg(mean_dat = ('familiarity', 'mean'),
-            sd_dat = ('familiarity', 'std'),
-            n_subj = ('familiarity', 'count'))
+        .agg(mean_dat = ('value', 'mean'),
+            sd_dat = ('value', 'std'),
+            n_subj = ('value', 'count'))
     )
     dat4plot['se_dat'] = dat4plot['sd_dat'] / np.sqrt(dat4plot['n_subj'])
     dat4plot['trial_type'] = pd.Categorical(
@@ -57,7 +58,7 @@ def plot_day1_byType(data, title, my_color):
     )
 
     ax.set_xlabel("Trial type")
-    ax.set_ylabel("Familiarity")
+    ax.set_ylabel(measure)
     ax.set_title(title)
 
     ax.spines["top"].set_visible(False)
@@ -137,6 +138,74 @@ def plot_day2_byType(data_s1, data_s2, measure, ylab, title):
 
     fig.tight_layout()
     return fig, ax
+
+def plot_delta_byType(data_s1, data_s2, measure, ylab, title, colors=None):
+    trial_order = ['within_legal',
+               'between_legal',
+               'within_illegal',
+               'between_illegal']
+    
+    d1 = (
+        data_s1
+        .groupby(['subj', 'trial_type'], as_index=False)
+        .agg(value = (measure, 'mean'))
+    )
+    d2 = (
+        data_s2
+        .groupby(['subj', 'trial_type'], as_index=False)
+        .agg(value = (measure, 'mean'))
+    )
+
+    delta_subj = d1.merge(
+        d2,
+        on=['subj', 'trial_type'],
+        how='inner',
+        suffixes=('_s1', '_s2')
+    )
+    delta_subj['delta'] = (
+        delta_subj['value_s2'] - delta_subj['value_s1']
+    )
+    delta_subj['trial_type'] = pd.Categorical(
+        delta_subj['trial_type'],
+        categories=trial_order,
+        ordered=True
+    )
+    delta_subj = delta_subj.sort_values('trial_type').reset_index(drop=True)
+
+    if colors is None:
+        palette_whole = sns.color_palette('Paired', 12)
+        colors = [palette_whole[i] for i in [0, 2, 6, 4]]
+    
+    fig, ax = plt.subplots(figsize=(3, 2.5))
+    sns.barplot(data = delta_subj, 
+                x='trial_type', 
+                y='delta', 
+                order=trial_order,
+                errorbar=None,
+                hue='trial_type',
+                hue_order=trial_order,
+                dodge=False,
+                palette=colors, 
+                width=0.4,
+                ax=ax)
+    
+    ax.set_xticklabels(
+        [
+            "Within-legal",
+            "Between-legal",
+            "Within-illegal",
+            "Between-illegal",
+        ],
+        rotation=20,
+        ha='right'
+    )
+    ax.set_xlabel('Trial type')
+    ax.set_ylabel(ylab)
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    
+    return ax
 
 def summarize_cross_block(data, measure, trial_order):
     # check behavioural change within session 1
