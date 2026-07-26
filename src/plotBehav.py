@@ -67,7 +67,8 @@ def plot_day1_byType(data, measure, title, my_color):
     plt.tight_layout()
     return ax
 
-def plot_day2_byType(data_s1, data_s2, measure, ylab, title):
+def plot_day2_byType(data_s1, data_s2, measure, ylab, title, ax=None):
+    """Plot session-1 and session-2 responses by trial type on ``ax``."""
     trial_order = ['within_legal',
                'between_legal',
                'within_illegal',
@@ -86,9 +87,10 @@ def plot_day2_byType(data_s1, data_s2, measure, ylab, title):
 
     session_order = ['Day1', 'Day2']
 
-    fig, ax = plt.subplots(
-        figsize=(5, 3)
-    )
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 3))
+    else:
+        fig = ax.figure
 
     sns.barplot(
         data=avg_within_subj,
@@ -127,19 +129,25 @@ def plot_day2_byType(data_s1, data_s2, measure, ylab, title):
     ax.set_ylabel(ylab)
     ax.set_title(title)
 
-    ax.legend(
-        title=None,
-        frameon=False,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5)
-    )
+    # ax.legend(
+    #     title=None,
+    #     frameon=False,
+    #     loc="center left",
+    #     bbox_to_anchor=(1.02, 0.5)
+    # )
+
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
 
     sns.despine(ax=ax)
 
-    fig.tight_layout()
+    if ax.figure is fig and len(fig.axes) == 1:
+        fig.tight_layout()
     return fig, ax
 
-def plot_delta_byType(data_s1, data_s2, measure, ylab, title, colors=None):
+def plot_delta_byType(data_s1, data_s2, measure, ylab, title, colors=None, ax=None):
+    """Plot the session-2 minus session-1 change by trial type on ``ax``."""
     trial_order = ['within_legal',
                'between_legal',
                'within_illegal',
@@ -176,7 +184,10 @@ def plot_delta_byType(data_s1, data_s2, measure, ylab, title, colors=None):
         palette_whole = sns.color_palette('Paired', 12)
         colors = [palette_whole[i] for i in [0, 2, 6, 4]]
     
-    fig, ax = plt.subplots(figsize=(3, 2.5))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(3, 2.5))
+    else:
+        fig = ax.figure
     sns.barplot(data = delta_subj, 
                 x='trial_type', 
                 y='delta', 
@@ -205,6 +216,8 @@ def plot_delta_byType(data_s1, data_s2, measure, ylab, title, colors=None):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     
+    if ax.figure is fig and len(fig.axes) == 1:
+        fig.tight_layout()
     return ax
 
 def summarize_cross_block(data, measure, trial_order):

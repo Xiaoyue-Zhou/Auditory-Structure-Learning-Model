@@ -12,7 +12,8 @@ class ModelParameters:
     decision_gain: float = 20.0
     criterion_offset: float = 0.0
 
-    readout_mode: str = 'normalized'  # alternatives: 'contrast'
+    readout_mode: str = 'normalized'  # alternatives: 'contrast', 'softmax'
+    softmax_temperature: float = 20.0
 
     lr: float = 1.0 # exposure learing rate
     lr_test_prefix:float = 1.0 # learning prefix of test sequences
@@ -148,6 +149,9 @@ class HebbianSequenceModel:
             raw association minus row-average association
             this is a behavioural-level readout
             reflecting confidence (amount of availavble memory), which is influenced by global decay
+        familiarity_softmax:
+            softmax probability across non-self targets. Unlike row normalization,
+            global changes in weight strength affect how peaked the distribution is.
         '''
         cue = int(cue)
         target = int(target)
@@ -167,6 +171,20 @@ class HebbianSequenceModel:
         row_mean = row_sum / (self.n_nodes - 1)
         familiarity_contrast = row_raw[target] - row_mean
 
+        if self.params.softmax_temperature <= 0:
+            raise ValueError('softmax_temperature must be positive.')
+
+        non_self = np.arange(self.n_nodes) != cue
+        softmax_logits = row_raw[non_self] / self.params.softmax_temperature
+        softmax_logits -= softmax_logits.max()
+        softmax_probs = np.exp(softmax_logits)
+        softmax_probs /= softmax_probs.sum()
+        if target == cue:
+            familiarity_softmax = 0.0
+        else:
+            target_position = target - int(target > cue)
+            familiarity_softmax = softmax_probs[target_position]
+
         # choose behaviour evidence
         if self.params.readout_mode == 'normalized':
             familiarity = familiarity_normalized
@@ -175,6 +193,10 @@ class HebbianSequenceModel:
         elif self.params.readout_mode == 'contrast':
             familiarity = familiarity_contrast
             decision_evidence = familiarity - self.params.criterion_offset
+
+        elif self.params.readout_mode == 'softmax':
+            familiarity = familiarity_softmax
+            decision_evidence = familiarity - uniform_baseline - self.params.criterion_offset
         else:
             raise ValueError(f"Unknown readout mode: {self.params.readout_mode}")
         
@@ -184,6 +206,7 @@ class HebbianSequenceModel:
             "familiarity": familiarity,
             "familiarity_normalized": familiarity_normalized,
             "familiarity_contrast": familiarity_contrast,
+            "familiarity_softmax": familiarity_softmax,
             "decision_evidence": decision_evidence,
             "p_yes": p_yes,
             "row_strength": row_sum,
@@ -209,6 +232,7 @@ class HebbianSequenceModel:
         familiarity = np.empty(n_trial, dtype=float)
         familiarity_normalized = np.empty(n_trial, dtype=float)
         familiarity_contrast = np.empty(n_trial, dtype=float)
+        familiarity_softmax = np.empty(n_trial, dtype=float)
         decision_evidence = np.empty(n_trial, dtype=float)
         p_yes = np.empty(n_trial, dtype=float)
         row_strength = np.empty(n_trial, dtype=float)
@@ -234,6 +258,7 @@ class HebbianSequenceModel:
             familiarity[iTrial] = readout['familiarity']
             familiarity_normalized[iTrial] = readout['familiarity_normalized']
             familiarity_contrast[iTrial] = readout['familiarity_contrast']
+            familiarity_softmax[iTrial] = readout['familiarity_softmax']
             decision_evidence[iTrial] = readout['decision_evidence']
             p_yes[iTrial] = readout['p_yes']
             row_strength[iTrial] = readout['row_strength']
@@ -247,6 +272,7 @@ class HebbianSequenceModel:
         results['familiarity'] = familiarity
         results['familiarity_normalized'] = familiarity_normalized
         results['familiarity_contrast'] = familiarity_contrast
+        results['familiarity_softmax'] = familiarity_softmax
         results['decision_evidence'] = decision_evidence
         results['p_yes'] = p_yes
         results['row_strength'] = row_strength
