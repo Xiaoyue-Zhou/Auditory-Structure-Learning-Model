@@ -181,10 +181,11 @@ def plot_learned_network(
         (500, 800)
     )
 
-    palette = sns.color_palette(
-        "pastel",
-        n_colors=len(np.unique(community))
-    )
+    palette = ['#b3b3b3', '#4d4d4d']
+    # palette = sns.color_palette(
+    #     "pastel",
+    #     n_colors=len(np.unique(community))
+    # )
 
     unique_comm = np.unique(community)
 
